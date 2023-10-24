@@ -34,20 +34,19 @@ from . import EmpiricalCovariance, empirical_covariance, log_likelihood
 
 # Helper functions to compute the objective and dual objective functions
 # of the l1-penalized estimator
-def _objective(mle, precision_, alpha):
+def _objective(mle, precision_, P):
     """Evaluation of the graphical-lasso objective function
 
-    the objective function is made of a shifted scaled version of the
+    The objective function is made of a shifted scaled version of the
     normalized log-likelihood (i.e. its empirical mean over the samples) and a
-    penalisation term to promote sparsity
+    penalization term to promote sparsity.
     """
     p = precision_.shape[0]
     cost = -2.0 * log_likelihood(mle, precision_) + p * np.log(2 * np.pi)
-    cost += alpha * (np.abs(precision_).sum() - np.abs(np.diag(precision_)).sum())
+    cost += (np.abs(precision_) * P).sum() - (np.abs(np.diag(precision_)) * np.diag(P)).sum()
     return cost
 
-
-def _dual_gap(emp_cov, precision_, alpha):
+def _dual_gap(emp_cov, precision_, P):
     """Expression of the dual gap convergence criterion
 
     The specific definition is given in Duchi "Projected Subgradient Methods
@@ -55,14 +54,13 @@ def _dual_gap(emp_cov, precision_, alpha):
     """
     gap = np.sum(emp_cov * precision_)
     gap -= precision_.shape[0]
-    gap += alpha * (np.abs(precision_).sum() - np.abs(np.diag(precision_)).sum())
+    gap += (np.abs(precision_) * P).sum() - (np.abs(np.diag(precision_)) * np.diag(P)).sum()
     return gap
 
 
-# The g-lasso algorithm
 def _graphical_lasso(
     emp_cov,
-    alpha,
+    P,  # replacing alpha with matrix P for regularization
     *,
     cov_init=None,
     mode="cd",
@@ -73,7 +71,7 @@ def _graphical_lasso(
     eps=np.finfo(np.float64).eps,
 ):
     _, n_features = emp_cov.shape
-    if alpha == 0:
+    if np.all(P == 0):
         # Early return without regularization
         precision_ = linalg.inv(emp_cov)
         cost = -2.0 * log_likelihood(emp_cov, precision_)
@@ -85,53 +83,45 @@ def _graphical_lasso(
         covariance_ = emp_cov.copy()
     else:
         covariance_ = cov_init.copy()
-    # As a trivial regularization (Tikhonov like), we scale down the
-    # off-diagonal coefficients of our starting point: This is needed, as
-    # in the cross-validation the cov_init can easily be
-    # ill-conditioned, and the CV loop blows. Beside, this takes
-    # conservative stand-point on the initial conditions, and it tends to
-    # make the convergence go faster.
+
     covariance_ *= 0.95
     diagonal = emp_cov.flat[:: n_features + 1]
     covariance_.flat[:: n_features + 1] = diagonal
     precision_ = linalg.pinvh(covariance_)
 
     indices = np.arange(n_features)
-    i = 0  # initialize the counter to be robust to `max_iter=0`
+    i = 0
     costs = list()
-    # The different l1 regression solver have different numerical errors
+
     if mode == "cd":
         errors = dict(over="raise", invalid="ignore")
     else:
         errors = dict(invalid="raise")
+
     try:
-        # be robust to the max_iter=0 edge case, see:
-        # https://github.com/scikit-learn/scikit-learn/issues/4134
         d_gap = np.inf
-        # set a sub_covariance buffer
         sub_covariance = np.copy(covariance_[1:, 1:], order="C")
         for i in range(max_iter):
             for idx in range(n_features):
-                # To keep the contiguous matrix `sub_covariance` equal to
-                # covariance_[indices != idx].T[indices != idx]
-                # we only need to update 1 column and 1 line when idx changes
                 if idx > 0:
                     di = idx - 1
                     sub_covariance[di] = covariance_[di][indices != idx]
                     sub_covariance[:, di] = covariance_[:, di][indices != idx]
                 else:
                     sub_covariance[:] = covariance_[1:, 1:]
+
                 row = emp_cov[idx, indices != idx]
                 with np.errstate(**errors):
                     if mode == "cd":
-                        # Use coordinate descent
                         coefs = -(
                             precision_[indices != idx, idx]
                             / (precision_[idx, idx] + 1000 * eps)
                         )
+                        # Modify the regularization strength using P matrix
+                        rho_values = P[idx, indices != idx]
                         coefs, _, _, _ = cd_fast.enet_coordinate_descent_gram(
                             coefs,
-                            alpha,
+                            rho_values,  # Passing vector of regularization strengths
                             0,
                             sub_covariance,
                             row,
@@ -142,17 +132,17 @@ def _graphical_lasso(
                             False,
                         )
                     else:  # mode == "lars"
+                        rho_values = P[idx, indices != idx]
                         _, _, coefs = lars_path_gram(
                             Xy=row,
                             Gram=sub_covariance,
                             n_samples=row.size,
-                            alpha_min=alpha / (n_features - 1),
+                            alpha_min=np.max(rho_values / (n_features - 1)),
                             copy_Gram=True,
                             eps=eps,
                             method="lars",
                             return_path=False,
                         )
-                # Update the precision matrix
                 precision_[idx, idx] = 1.0 / (
                     covariance_[idx, idx]
                     - np.dot(covariance_[indices != idx, idx], coefs)
@@ -162,12 +152,13 @@ def _graphical_lasso(
                 coefs = np.dot(sub_covariance, coefs)
                 covariance_[idx, indices != idx] = coefs
                 covariance_[indices != idx, idx] = coefs
+
             if not np.isfinite(precision_.sum()):
                 raise FloatingPointError(
                     "The system is too ill-conditioned for this solver"
                 )
-            d_gap = _dual_gap(emp_cov, precision_, alpha)
-            cost = _objective(emp_cov, precision_, alpha)
+            d_gap = _dual_gap(emp_cov, precision_, P)  # Using mean of P for d_gap
+            cost = _objective(emp_cov, precision_, P)  # Using mean of P for cost
             if verbose:
                 print(
                     "[graphical_lasso] Iteration % 3i, cost % 3.2e, dual gap %.3e"
